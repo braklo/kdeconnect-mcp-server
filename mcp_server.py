@@ -6,9 +6,10 @@ Provides integration with KDE Connect devices through Model Context Protocol
 
 import sys
 import os
+import unicodedata
 
 # Import FastMCP first, before adding system paths
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 from fastmcp import FastMCP
 
@@ -56,6 +57,35 @@ def _parse_sms_message(msg) -> Dict[str, Any]:
         "sub_id": int(msg[8]),
         "attachment_count": len(msg[9]),
     }
+
+
+def _norm(text: str) -> str:
+    """Normalize text for diacritic- and case-insensitive comparison:
+    NFD-decompose, strip combining marks (accents), casefold. E.g. both
+    "objednávka" and "objednavka" normalize to "objednavka", so a query
+    typed without diacritics still matches accented text and vice versa."""
+    if not text:
+        return ""
+    decomposed = unicodedata.normalize("NFD", text)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return stripped.casefold()
+
+
+def _parse_since(since: str) -> int:
+    """Parse an ISO-ish date or datetime string into epoch milliseconds,
+    matching the `date_ms` field used throughout this module. Accepts
+    "2026-07-01", "2026-07-01 12:00", "2026-07-01 12:00:00" and general
+    ISO 8601 (e.g. "2026-07-01T12:00")."""
+    import datetime
+    s = since.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    dt = datetime.datetime.fromisoformat(s)
+    return int(dt.timestamp() * 1000)
 
 
 class KDEConnectDBus:
@@ -340,57 +370,73 @@ class KDEConnectDBus:
         obj = self.bus.get_object(self.BUS_NAME, path)
         return dbus.Interface(obj, "org.kde.kdeconnect.device.conversations")
 
-    def _collect_signals(
+    def _run_conversation_round(
         self,
-        signal_name: str,
+        thread_id: int,
         request_fn,
-        wait_seconds: float = 8.0,
-        quiet_seconds: float = 1.5,
-        thread_filter: int = None,
-    ) -> List[Dict[str, Any]]:
-        """Run an asynchronous D-Bus request and collect emitted message
-        signals until either a quiet period elapses or the hard timeout is
-        reached. The KDE Connect conversations plugin streams matching
-        messages one signal at a time, so we listen on the bus, invoke
-        `request_fn` to kick off the load, and then return all collected
-        message dicts."""
-        import time
-        messages = []
-        last_signal = [time.time()]
+        round_timeout: float,
+    ) -> tuple:
+        """Run a single conversationUpdated/conversationLoaded collection
+        round for ONE thread: invoke `request_fn`, collect
+        `conversationUpdated` signals filtered to `thread_id`, and stop as
+        soon as `conversationLoaded` fires for that thread (success, the
+        `messageCount` is authoritative) or `round_timeout` elapses
+        (fallback poison pill -- a timeout is NOT a success).
 
-        def on_signal(payload, *_, **__):
+        Returns `(messages_by_id, reported_count_or_None, timed_out)`.
+        """
+        import time
+        messages: Dict[int, Dict[str, Any]] = {}
+        state = {"reported_count": None, "loaded": False}
+        tid = int(thread_id)
+
+        def on_updated(payload, *_, **__):
             try:
-                if thread_filter is not None and int(payload[6]) != thread_filter:
+                if int(payload[6]) != tid:
                     return
-                messages.append(_parse_sms_message(payload))
-                last_signal[0] = time.time()
+                m = _parse_sms_message(payload)
+                messages[m["message_id"]] = m
             except Exception:
                 pass
 
-        match = self.bus.add_signal_receiver(
-            on_signal,
-            signal_name=signal_name,
+        def on_loaded(conv_id, count, *_, **__):
+            try:
+                if int(conv_id) == tid:
+                    state["reported_count"] = int(count)
+                    state["loaded"] = True
+            except Exception:
+                pass
+
+        match_updated = self.bus.add_signal_receiver(
+            on_updated,
+            signal_name="conversationUpdated",
+            dbus_interface="org.kde.kdeconnect.device.conversations",
+        )
+        match_loaded = self.bus.add_signal_receiver(
+            on_loaded,
+            signal_name="conversationLoaded",
             dbus_interface="org.kde.kdeconnect.device.conversations",
         )
 
         loop = GLib.MainLoop()
-        deadline = time.time() + wait_seconds
+        deadline = time.time() + round_timeout
 
         def check_done():
-            now = time.time()
-            if now >= deadline or (now - last_signal[0]) >= quiet_seconds:
+            if state["loaded"] or time.time() >= deadline:
                 loop.quit()
                 return False
             return True
 
-        GLib.timeout_add(300, check_done)
+        GLib.timeout_add(150, check_done)
         try:
             request_fn()
             loop.run()
         finally:
-            match.remove()
+            match_updated.remove()
+            match_loaded.remove()
 
-        return messages
+        timed_out = not state["loaded"]
+        return messages, state["reported_count"], timed_out
 
     def _cached_threads(self, iface) -> Dict[int, Dict[str, Any]]:
         """Read the daemon's conversation cache and reduce it to one entry
@@ -482,28 +528,272 @@ class KDEConnectDBus:
             "oldest_message": oldest["date"] if oldest else None,
         }
 
+    def load_thread_messages(
+        self, device_id: str, thread_id: int, since_ms: int = None,
+        max_rounds: int = 6, per_round_window: int = 200,
+        round_timeout: float = 8.0,
+    ) -> tuple:
+        """Deeply load ONE thread's messages by repeatedly calling
+        `requestConversation` until the daemon reports the full message
+        count via `conversationLoaded` (authoritative, not a guess).
+
+        Each round asks `requestConversation(thread_id, 0, per_round_window)`
+        and collects `conversationUpdated` signals for that thread, ending
+        the round on the matching `conversationLoaded` (primary) or on
+        `round_timeout` (a fallback -- a timeout is NOT success). Rounds
+        repeat until one of:
+          - the unique message count stops growing (convergence), or
+          - `since_ms` is given and the oldest message collected so far is
+            already older than it (no need to go deeper), or
+          - `max_rounds` is exhausted.
+
+        Returns `(messages, meta)`, messages sorted oldest first:
+            meta = {
+                "complete": bool,     # converged/reached_since, no timeout,
+                                       # and reported_count matches (or is
+                                       # unknown)
+                "rounds": int,
+                "messages": int,
+                "reported_count": int | None,  # last conversationLoaded count
+                "converged": bool,
+                "reached_since": bool,
+                "timed_out": bool,    # last round's timeout state
+            }
+        """
+        iface = self._get_conversations_interface(device_id)
+        tid = int(thread_id)
+        seen: Dict[int, Dict[str, Any]] = {}
+        reported_count = None
+        converged = False
+        reached_since = False
+        timed_out = False
+        rounds_done = 0
+
+        for round_num in range(int(max_rounds)):
+            rounds_done = round_num + 1
+            before = len(seen)
+
+            round_messages, count, round_timed_out = self._run_conversation_round(
+                tid,
+                lambda: iface.requestConversation(
+                    dbus.Int64(tid), 0, int(per_round_window)
+                ),
+                round_timeout,
+            )
+            seen.update(round_messages)
+            timed_out = round_timed_out
+            if count is not None:
+                reported_count = count
+
+            if since_ms is not None and seen:
+                oldest_ms = min(m["date_ms"] for m in seen.values())
+                if oldest_ms <= since_ms:
+                    reached_since = True
+                    break
+
+            if len(seen) == before:
+                converged = True
+                break
+
+        count_matches = reported_count is None or reported_count == len(seen)
+        complete = (converged or reached_since) and not timed_out and count_matches
+
+        messages = sorted(seen.values(), key=lambda m: m["date_ms"])
+        meta = {
+            "complete": complete,
+            "rounds": rounds_done,
+            "messages": len(messages),
+            "reported_count": reported_count,
+            "converged": converged,
+            "reached_since": reached_since,
+            "timed_out": timed_out,
+        }
+        return messages, meta
+
+    def load_threads_deep(
+        self, device_id: str, thread_ids: List[int], since_ms: int = None,
+        concurrency: int = 6, total_budget_seconds: float = 60.0,
+    ) -> tuple:
+        """Deeply load MULTIPLE threads concurrently.
+
+        `_run_conversation_round` spins its own GLib MainLoop, so N of its
+        instances cannot be nested to run in parallel. This method instead
+        shares ONE signal receiver + ONE MainLoop across every thread and
+        demultiplexes incoming signals by thread_id, while holding a sliding
+        concurrency window: at most `concurrency` threads are in flight at
+        once, and a finished slot (its `conversationLoaded` fired, or -- if
+        `since_ms` is given -- it already reached that depth) is refilled
+        from the pending queue. Verified safe up to 10 concurrent requests;
+        do not raise `concurrency` above that without re-testing.
+
+        Each thread gets a single `requestConversation(id, 0, 200)` round
+        (no per-thread convergence looping, unlike `load_thread_messages`);
+        a per-thread timeout applies on top of the shared
+        `total_budget_seconds`, which is a hard cap on the whole call --
+        threads left over when it expires are reported, never silently
+        dropped.
+
+        Returns `(results, coverage)`:
+            results = {thread_id: [messages sorted oldest first], ...}
+                      (present for every id in `thread_ids`, possibly empty)
+            coverage = {
+                "threads_selected": int,
+                "threads_searched": int,       # got conversationLoaded or
+                                                # reached since_ms depth
+                "threads_timeout": [ids],      # launched but never finished
+                "threads_not_reached": [ids],  # never even got a request
+                "messages_searched": int,      # total messages collected,
+                                                # across searched AND
+                                                # timed-out threads
+                "budget_exhausted": bool,
+            }
+        """
+        import time
+        tids = [int(t) for t in thread_ids]
+        concurrency = max(1, int(concurrency))
+        results: Dict[int, Dict[int, Dict[str, Any]]] = {t: {} for t in tids}
+
+        if not tids:
+            return {}, {
+                "threads_selected": 0,
+                "threads_searched": 0,
+                "threads_timeout": [],
+                "threads_not_reached": [],
+                "messages_searched": 0,
+                "budget_exhausted": False,
+            }
+
+        iface = self._get_conversations_interface(device_id)
+        pending = list(tids)
+        in_flight: Dict[int, Dict[str, Any]] = {}
+        done_ids: set = set()
+        timed_out_ids: set = set()
+
+        start = time.time()
+        deadline = start + float(total_budget_seconds)
+        PER_THREAD_TIMEOUT = 15.0
+
+        def on_updated(payload, *_, **__):
+            try:
+                tid = int(payload[6])
+                if tid not in in_flight:
+                    return
+                m = _parse_sms_message(payload)
+                results[tid][m["message_id"]] = m
+                if since_ms is not None and m["date_ms"] <= since_ms:
+                    in_flight[tid]["reached_since"] = True
+            except Exception:
+                pass
+
+        def on_loaded(conv_id, count, *_, **__):
+            try:
+                tid = int(conv_id)
+                if tid in in_flight:
+                    in_flight[tid]["loaded"] = True
+            except Exception:
+                pass
+
+        match_updated = self.bus.add_signal_receiver(
+            on_updated,
+            signal_name="conversationUpdated",
+            dbus_interface="org.kde.kdeconnect.device.conversations",
+        )
+        match_loaded = self.bus.add_signal_receiver(
+            on_loaded,
+            signal_name="conversationLoaded",
+            dbus_interface="org.kde.kdeconnect.device.conversations",
+        )
+
+        def launch(tid):
+            in_flight[tid] = {
+                "loaded": False,
+                "reached_since": False,
+                "deadline": min(time.time() + PER_THREAD_TIMEOUT, deadline),
+            }
+            iface.requestConversation(dbus.Int64(tid), 0, 200)
+
+        loop = GLib.MainLoop()
+
+        def pump():
+            now = time.time()
+            for tid in list(in_flight.keys()):
+                state = in_flight[tid]
+                if state["loaded"] or state["reached_since"]:
+                    done_ids.add(tid)
+                    del in_flight[tid]
+                elif now >= state["deadline"]:
+                    timed_out_ids.add(tid)
+                    done_ids.add(tid)
+                    del in_flight[tid]
+
+            while pending and len(in_flight) < concurrency and now < deadline:
+                launch(pending.pop(0))
+
+            if now >= deadline:
+                loop.quit()
+                return False
+            if not pending and not in_flight:
+                loop.quit()
+                return False
+            return True
+
+        try:
+            while pending and len(in_flight) < concurrency:
+                launch(pending.pop(0))
+            if in_flight or pending:
+                GLib.timeout_add(200, pump)
+                loop.run()
+        finally:
+            match_updated.remove()
+            match_loaded.remove()
+
+        budget_exhausted = time.time() >= deadline
+        # Anything still in flight when the loop ended (budget ran out) is a
+        # timeout, not a "not reached" -- it was launched.
+        for tid in list(in_flight.keys()):
+            timed_out_ids.add(tid)
+            done_ids.add(tid)
+        not_reached_ids = [t for t in tids if t not in done_ids]
+        searched_ids = [t for t in tids if t in done_ids and t not in timed_out_ids]
+
+        out_results: Dict[int, List[Dict[str, Any]]] = {}
+        total_messages = 0
+        for tid in tids:
+            msgs = sorted(results[tid].values(), key=lambda m: m["date_ms"])
+            out_results[tid] = msgs
+            total_messages += len(msgs)
+
+        coverage = {
+            "threads_selected": len(tids),
+            "threads_searched": len(searched_ids),
+            "threads_timeout": sorted(timed_out_ids),
+            "threads_not_reached": sorted(not_reached_ids),
+            "messages_searched": total_messages,
+            "budget_exhausted": budget_exhausted,
+        }
+        return out_results, coverage
+
     def read_sms_conversation(
         self, device_id: str, thread_id: int, limit: int = 50,
         wait_seconds: float = 15.0,
-    ) -> List[Dict[str, Any]]:
-        """Return up to `limit` most recent messages from a single thread,
-        ordered chronologically (oldest first)."""
-        iface = self._get_conversations_interface(device_id)
-        messages = self._collect_signals(
-            "conversationUpdated",
-            lambda: iface.requestConversation(
-                dbus.Int64(thread_id), 0, int(limit)
-            ),
-            wait_seconds=wait_seconds,
-            quiet_seconds=2.5,
-            thread_filter=int(thread_id),
+    ) -> tuple:
+        """Return the message history of a single thread, ordered
+        chronologically (oldest first), using `load_thread_messages` --
+        i.e. driven by the authoritative `conversationLoaded` count rather
+        than a quiet-period guess. `limit` sizes the per-round request
+        window (floored at 200) but does NOT truncate the result: the
+        daemon's `end` argument is not an actual cap (see
+        `load_thread_messages`/`_run_conversation_round`), convergence is.
+
+        Returns `(messages, meta)` -- `meta` is `load_thread_messages`'s
+        meta dict, whose `complete` says whether this really is the full
+        thread history.
+        """
+        return self.load_thread_messages(
+            device_id, int(thread_id),
+            max_rounds=6, per_round_window=max(int(limit), 200),
+            round_timeout=wait_seconds,
         )
-        seen = {}
-        for m in messages:
-            seen[m["message_id"]] = m
-        out = list(seen.values())
-        out.sort(key=lambda m: m["date_ms"])
-        return out
 
     def send_sms(
         self, device_id: str, text: str,
@@ -853,6 +1143,9 @@ def list_sms_conversations(
     not exist". Either raise `wait_seconds`, call again to let the cache fill
     further, or check progress with `sms_cache_status`.
 
+    The daemon's cache is in-memory only: a `kdeconnectd` restart empties it,
+    and the next call here starts the load over from zero.
+
     Args:
         device_id: KDE Connect device ID (from `list_devices`)
         refresh: If True, ask the phone to (re)stream thread heads and wait
@@ -924,29 +1217,54 @@ def read_sms_conversation(
     wait_seconds: float = 15.0,
 ) -> Dict[str, Any]:
     """
-    Read the message history of a single SMS thread
+    Read the full message history of a single SMS thread
 
-    Returns up to `limit` most recent messages, ordered chronologically
-    (oldest first), so the conversation reads naturally top-to-bottom.
+    Repeatedly requests the thread until the daemon confirms (via its
+    `conversationLoaded` message count, not a quiet-period guess) that the
+    load is complete, or until `wait_seconds` per round / round budget runs
+    out. Messages are ordered chronologically (oldest first), so the
+    conversation reads naturally top-to-bottom.
+
+    Note: MMS messages often have an empty `body` (the content is an
+    attachment) -- don't read an empty body as "no message here". The
+    daemon's cache is in-memory: a `kdeconnectd` restart empties it and the
+    next read starts the load over.
 
     Args:
         device_id: KDE Connect device ID (from `list_devices`)
         thread_id: Thread ID (from `list_sms_conversations`)
-        limit: Maximum number of messages to return
-        wait_seconds: Hard timeout for the streaming collect
+        limit: How many of the NEWEST messages to return (the thread is
+            always loaded to convergence first, so `complete` stays
+            meaningful); `total_messages` and `truncated` report what was
+            held back. Also floors the per-round request window at 200.
+        wait_seconds: Hard timeout per loading round
 
     Returns:
         Dictionary with `messages` (list of {body, direction, date,
-        addresses, ...}) and `count`.
+        addresses, ...}), `count`, `complete` (whether this is confirmed to
+        be the FULL thread history -- if False, treat the result as a
+        partial, unsearched-surface load, not the whole conversation) and
+        `load` (full loading metadata).
     """
-    messages = kdeconnect.read_sms_conversation(
+    messages, meta = kdeconnect.read_sms_conversation(
         device_id, int(thread_id), limit=int(limit),
         wait_seconds=wait_seconds,
     )
+    # The thread is always loaded to convergence -- that is what makes
+    # `complete` meaningful -- but only the newest `limit` messages are
+    # returned, so a 164-message thread does not blow up the caller's
+    # context when it asked for 50. `total_messages` exposes the difference.
+    total_messages = len(messages)
+    if int(limit) > 0:
+        messages = messages[-int(limit):]
     return {
         "thread_id": int(thread_id),
         "messages": messages,
         "count": len(messages),
+        "total_messages": total_messages,
+        "truncated": total_messages > len(messages),
+        "complete": meta["complete"],
+        "load": meta,
     }
 
 
@@ -958,61 +1276,194 @@ def search_sms(
     refresh: bool = True,
     limit: int = 50,
     wait_seconds: float = 20.0,
+    since: Optional[str] = None,
+    deep: bool = False,
+    max_deep_threads: int = 50,
+    deep_budget_seconds: float = 60.0,
 ) -> Dict[str, Any]:
     """
-    Case-insensitive search across all SMS threads
+    Diacritic- and case-insensitive search across SMS threads
 
-    Filters threads whose last-message body or sender address contains the
-    given query string. Only the newest message of each thread is searched;
-    for a full-content search inside a thread, call `read_sms_conversation`.
+    By default (no `since`, `deep=False`) this only searches the NEWEST
+    message of every thread (the thread "head") -- cheap, but it will miss a
+    hit buried earlier in a conversation. Pass `since` and/or `deep=True` to
+    also pull full thread content and search every message in it.
 
-    IMPORTANT — this searches the history loaded so far, which may be a
-    fraction of the mailbox (the phone streams slowly). Check `complete` in
-    the result: when it is False, zero matches is a tool limitation, not a
-    negative finding.
+    Matching is diacritic- and case-insensitive (NFD-normalized, accents
+    stripped, casefolded) on both the query and the text -- "objednavka" and
+    "objednávka" are treated as the same query, which matters because
+    service/notification SMS in Slovak/Czech commonly drop diacritics.
+
+    MMS messages often have an empty `body` (their content is an
+    attachment), so deep search over an MMS-heavy thread can miss it even
+    when the phone-side content would "obviously" match. The daemon's
+    thread/message cache is in-memory only -- a `kdeconnectd` restart empties
+    it and the next search starts loading from zero again.
+
+    IMPORTANT -- read `coverage.verdict`, not just `count`. It is one of:
+      - "heads_only": neither `since` nor `deep` was given, so only thread
+        heads were searched -- most of each conversation is unsearched.
+      - "partial": deep search ran but did not fully cover the candidate
+        threads (a timeout, an unreached thread, or the `max_deep_threads`
+        cap trimmed the candidate set).
+      - "complete": thread heads finished loading AND every deep candidate
+        thread was fully searched within budget, with none dropped by the
+        cap.
+    When `count == 0` and `verdict != "complete"`, the result also carries
+    `zero_matches_meaning` -- treat that as an unsearched surface, never as
+    proof the message does not exist.
 
     Args:
         device_id: KDE Connect device ID
-        query: Substring to look for (case-insensitive)
+        query: Substring to look for (diacritic/case-insensitive)
         scope: Where to search — "body", "address", or "both" (default)
-        refresh: If True, ask the phone to stream and wait for the cache to
-            settle before searching
-        limit: Maximum number of matching threads to return
-        wait_seconds: Hard cap on the load wait (default 20s)
+        refresh: If True, ask the phone to stream and wait for the thread-
+            head cache to settle before searching
+        limit: Maximum number of matching messages to return
+        wait_seconds: Hard cap on the thread-head load wait (default 20s)
+        since: ISO date/datetime (e.g. "2026-07-01" or "2026-07-01 12:00").
+            When given, deep-searches every thread whose head is at or after
+            this date (an older head means the thread has no activity in
+            this window at all) and filters deep hits to messages at or
+            after it too. Implies deep search.
+        deep: Force deep search even without `since` — pulls full content
+            for the `max_deep_threads` newest threads
+        max_deep_threads: Cap on how many threads get deep-loaded; the rest
+            are reported (never silently dropped) under
+            `coverage.deep.threads_skipped_over_cap`
+        deep_budget_seconds: Hard wall-clock cap on the whole deep phase
 
     Returns:
-        Dictionary with `matches` (list of thread heads), `count`,
-        `complete`, `searched_threads` and, when truncated, a `warning`.
+        Dictionary with `matches` (list of message dicts, each tagged
+        `matched_via`: "head" or "deep"; newest first, deduplicated by
+        `message_id`), `count`, `query`, `scope`, `complete` (== whether
+        `coverage.verdict` is "complete"), `searched_threads` (thread heads
+        searched), `load` (thread-head load metadata), `coverage` (the
+        verdict object described above) and, when applicable, `warning` /
+        `zero_matches_meaning`.
     """
     threads, meta = kdeconnect.load_sms_threads(
         device_id, refresh=refresh, wait_seconds=wait_seconds
     )
-    q = query.lower()
-    matches = []
-    for t in threads:
-        in_body = scope in ("body", "both") and q in t["body"].lower()
+    q = _norm(query)
+
+    def _matches_text(body: str, addresses: List[str]) -> bool:
+        in_body = scope in ("body", "both") and q in _norm(body)
         in_addr = scope in ("address", "both") and any(
-            q in a.lower() for a in t["addresses"]
+            q in _norm(a) for a in addresses
         )
-        if in_body or in_addr:
-            matches.append(t)
-        if len(matches) >= int(limit):
-            break
+        return in_body or in_addr
+
+    all_matches: Dict[int, Dict[str, Any]] = {}
+    for t in threads:
+        if _matches_text(t["body"], t["addresses"]):
+            m = dict(t)
+            m["matched_via"] = "head"
+            all_matches[m["message_id"]] = m
+
+    since_ms = None
+    if since:
+        try:
+            since_ms = _parse_since(since)
+        except ValueError as e:
+            return {
+                "status": "error",
+                "error": f"could not parse `since` ({since!r}): {e}",
+            }
+
+    deep_coverage = None
+    if deep or since_ms is not None:
+        if since_ms is not None:
+            candidates = [t for t in threads if t["date_ms"] >= since_ms]
+        else:
+            candidates = list(threads)  # already sorted newest-first
+
+        skipped_ids: List[int] = []
+        if len(candidates) > int(max_deep_threads):
+            skipped_ids = [t["thread_id"] for t in candidates[int(max_deep_threads):]]
+            candidates = candidates[: int(max_deep_threads)]
+
+        candidate_ids = [t["thread_id"] for t in candidates]
+        deep_results, deep_coverage = kdeconnect.load_threads_deep(
+            device_id, candidate_ids, since_ms=since_ms,
+            concurrency=6, total_budget_seconds=deep_budget_seconds,
+        )
+        deep_coverage["threads_skipped_over_cap"] = {
+            "count": len(skipped_ids), "thread_ids": skipped_ids,
+        }
+
+        for tid, msgs in deep_results.items():
+            for m in msgs:
+                if since_ms is not None and m["date_ms"] < since_ms:
+                    continue
+                if not _matches_text(m["body"], m["addresses"]):
+                    continue
+                if m["message_id"] in all_matches:
+                    continue  # already have it as a head match
+                mm = dict(m)
+                mm["matched_via"] = "deep"
+                all_matches[mm["message_id"]] = mm
+
+    if since_ms is not None:
+        # `since` scopes the whole search, head hits included -- otherwise a
+        # date-scoped query would still surface years-old thread heads.
+        all_matches = {
+            mid: m for mid, m in all_matches.items()
+            if m["date_ms"] >= since_ms
+        }
+    matches = sorted(all_matches.values(), key=lambda m: m["date_ms"], reverse=True)
+    total_matches = len(matches)
+    matches = matches[: int(limit)]
+
+    if deep_coverage is None:
+        verdict = "heads_only"
+        # Nothing was truncated *within the requested scope* if every thread
+        # head was loaded. The scope itself (heads only) is reported by
+        # `verdict`, so the two fields stay independent.
+        not_truncated = meta["complete"]
+    else:
+        deep_complete = (
+            not deep_coverage["budget_exhausted"]
+            and not deep_coverage["threads_timeout"]
+            and not deep_coverage["threads_not_reached"]
+            and deep_coverage["threads_skipped_over_cap"]["count"] == 0
+        )
+        not_truncated = meta["complete"] and deep_complete
+        verdict = "complete" if not_truncated else "partial"
+
+    coverage = {
+        "verdict": verdict,
+        "heads": {
+            "complete": meta["complete"],
+            "threads_seen": len(threads),
+            "oldest_head": threads[-1]["date"] if threads else None,
+        },
+        "deep": deep_coverage,
+    }
+
     out = {
         "matches": matches,
         "count": len(matches),
+        "total_matches": total_matches,
         "query": query,
         "scope": scope,
-        "complete": meta["complete"],
+        "complete": not_truncated,
         "searched_threads": len(threads),
         "load": meta,
+        "coverage": coverage,
     }
+    if len(matches) == 0 and verdict != "complete":
+        out["zero_matches_meaning"] = (
+            "unsearched surface remains — this is NOT evidence the message "
+            "does not exist"
+        )
     if not meta["complete"]:
         out["warning"] = (
-            f"Searched only the {len(threads)} threads loaded so far — the "
-            f"phone was still streaming. Zero matches here is NOT evidence "
-            f"that no such message exists; treat it as an unsearched surface, "
-            f"raise wait_seconds or check sms_cache_status."
+            f"Thread heads: searched only the {len(threads)} loaded so far — "
+            f"the phone was still streaming. Zero matches here is NOT "
+            f"evidence that no such message exists; treat it as an "
+            f"unsearched surface, raise wait_seconds or check "
+            f"sms_cache_status."
         )
     return out
 
