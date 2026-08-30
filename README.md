@@ -174,6 +174,41 @@ evidence that no such message exists.**
 - Contact names appear in `addresses` only when KDE Connect has the Contacts
   permission; otherwise you get phone numbers.
 
+### Two daemon bugs this client works around
+
+Both live in `kdeconnectd`, not here. Neither can be fixed from the client side;
+what the client can do is avoid provoking them and refuse to misreport them.
+
+**The daemon can deadlock in its SMS plugin** ([KDE bug 525025]). It keeps its
+PID, keeps its name on the bus and simply stops answering, at 0% CPU, with the
+main thread blocked taking a write lock in `Device::privateReceivedPacket` while
+its own worker threads hold the read lock and wait on a condition. Observed three
+times, always right after a deep (`since=`) search. Measured 2026-08-30: six
+concurrent `requestConversation` calls over 200 threads froze it, while two
+concurrent calls over the same 200 threads survived two consecutive runs, so
+`SMS_DEEP_CONCURRENCY` defaults to 2. That is evidence rather than proof — the
+underlying fault is a race — which is why raising it is a correctness risk and
+not a speed knob.
+
+Because a frozen daemon is otherwise indistinguishable from an empty mailbox,
+every SMS read tool probes liveness after the heavy phase and reports
+`status: "error"` with `coverage.verdict: "daemon_frozen"` rather than returning
+zero results. Recovery is to kill the process — it respawns on the next D-Bus
+call — and the SMS cache then starts from empty. You can exercise the probe
+without provoking the bug: `kill -STOP` on the daemon looks the same over D-Bus,
+and `kill -CONT` undoes it.
+
+**The daemon crashes when too many requests are in flight at once**
+([KDE bug 525021]): each pending `requestConversation` costs one eventfd, and
+past roughly 990 the GLib allocation fails with `g_error`, which is a SIGTRAP and
+a core dump rather than an error return. This client never approaches that — the
+sliding window caps requests in flight, and streaming thread heads costs no
+descriptors at all — but any client that fires requests without awaiting their
+replies will hit it.
+
+[KDE bug 525021]: https://bugs.kde.org/show_bug.cgi?id=525021
+[KDE bug 525025]: https://bugs.kde.org/show_bug.cgi?id=525025
+
 ### Required permissions
 
 The KDE Connect app on the phone needs **Read SMS** and, for `send_sms`, **Send

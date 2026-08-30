@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 
 # Add system site-packages for dbus-python after FastMCP import
 sys.path.append('/usr/lib/python3/dist-packages')
+import functools
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -98,6 +99,21 @@ class KDEConnectDBus:
     # How often to sample the daemon's conversation cache while waiting for
     # the phone to finish streaming thread heads.
     SMS_POLL_SECONDS = 2.0
+
+    # How many `requestConversation` calls may be in flight at once during a
+    # deep load. Deliberately low: the daemon's SMS plugin has a lock-
+    # ordering bug (KDE bug 525025) that freezes the whole daemon. Measured
+    # 2026-08-30 against 200 threads -- concurrency 6 froze it; concurrency 2
+    # survived two consecutive runs of the same 200 threads. At the freeze
+    # ten plugin worker threads were alive and piled on the same lock, so
+    # fewer requests in flight means a smaller window for that circular wait.
+    # This is evidence, not proof: the underlying fault is a race, so raising
+    # this value is a correctness risk, not just a speed knob.
+    SMS_DEEP_CONCURRENCY = 2
+
+    # Timeout for the liveness probe below. Generous on purpose -- a busy but
+    # healthy daemon must not be misreported as frozen.
+    SMS_HEALTH_TIMEOUT = 10.0
 
     def __init__(self):
         self.bus = dbus.SessionBus()
@@ -370,6 +386,32 @@ class KDEConnectDBus:
         obj = self.bus.get_object(self.BUS_NAME, path)
         return dbus.Interface(obj, "org.kde.kdeconnect.device.conversations")
 
+    def daemon_responsive(self, timeout: float = None) -> bool:
+        """Is `kdeconnectd` still answering D-Bus?
+
+        A daemon deadlocked in the SMS plugin (KDE bug 525025) does not die:
+        it keeps its PID, keeps its name on the bus and simply stops
+        replying, at 0% CPU. Without this probe such a daemon is
+        indistinguishable from an empty mailbox -- which is exactly the
+        false negative the rest of this module exists to prevent. Call it
+        after any heavy SMS operation and report a frozen daemon as an
+        error, never as "no results".
+        """
+        # `introspect=False` matters: a normally-built proxy first issues an
+        # Introspect call with dbus-python's own 25s timeout, which sits
+        # outside `timeout` and made this probe take 35s against a stopped
+        # daemon (measured 2026-08-30). Skipping introspection puts the whole
+        # wait back under our control.
+        try:
+            obj = self.bus.get_object(self.BUS_NAME, self.DAEMON_PATH,
+                                      introspect=False)
+            iface = dbus.Interface(obj, "org.kde.kdeconnect.daemon")
+            iface.devices(True, True,
+                          timeout=float(timeout or self.SMS_HEALTH_TIMEOUT))
+            return True
+        except dbus.exceptions.DBusException:
+            return False
+
     def _run_conversation_round(
         self,
         thread_id: int,
@@ -612,7 +654,7 @@ class KDEConnectDBus:
 
     def load_threads_deep(
         self, device_id: str, thread_ids: List[int], since_ms: int = None,
-        concurrency: int = 6, total_budget_seconds: float = 60.0,
+        concurrency: int = None, total_budget_seconds: float = 60.0,
     ) -> tuple:
         """Deeply load MULTIPLE threads concurrently.
 
@@ -623,8 +665,9 @@ class KDEConnectDBus:
         concurrency window: at most `concurrency` threads are in flight at
         once, and a finished slot (its `conversationLoaded` fired, or -- if
         `since_ms` is given -- it already reached that depth) is refilled
-        from the pending queue. Verified safe up to 10 concurrent requests;
-        do not raise `concurrency` above that without re-testing.
+        from the pending queue. `concurrency` defaults to
+        `SMS_DEEP_CONCURRENCY`; see that constant for why it is low and why
+        raising it is a correctness risk rather than a speed trade-off.
 
         Each thread gets a single `requestConversation(id, 0, 200)` round
         (no per-thread convergence looping, unlike `load_thread_messages`);
@@ -650,6 +693,8 @@ class KDEConnectDBus:
         """
         import time
         tids = [int(t) for t in thread_ids]
+        if concurrency is None:
+            concurrency = self.SMS_DEEP_CONCURRENCY
         concurrency = max(1, int(concurrency))
         results: Dict[int, Dict[int, Dict[str, Any]]] = {t: {} for t in tids}
 
@@ -828,6 +873,42 @@ kdeconnect = KDEConnectDBus()
 
 # Create FastMCP server
 mcp = FastMCP("KDE Connect MCP Server")
+
+# Recovery advice shared by every place that detects the frozen daemon, so
+# the caller reads the same instructions wherever the freeze surfaces.
+_FROZEN_DAEMON_HINT = (
+    "kdeconnectd is deadlocked in its SMS plugin (KDE bug 525025): it keeps "
+    "its PID and its name on the bus but answers nothing, at 0% CPU. "
+    "Waiting will not help. Recovery: kill the kdeconnectd process — it "
+    "respawns on the next D-Bus call — and expect its SMS cache to start "
+    "from empty. Treat any result from this call as a failure, never as "
+    "evidence that a message does not exist."
+)
+
+
+def _sms_daemon_guard(func):
+    """Translate a D-Bus failure in an SMS tool into an explicit diagnosis.
+
+    A daemon deadlocked in the SMS plugin does not answer, so calls against
+    it die on a generic `NoReply` that says nothing about the cause or the
+    fix. Catch that, ask whether the daemon is actually responsive, and if
+    it is not, return a structured error naming the bug. A DBusException
+    raised while the daemon IS responsive is something else entirely and is
+    re-raised untouched.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except dbus.exceptions.DBusException as exc:
+            if kdeconnect.daemon_responsive():
+                raise
+            return {
+                "status": "error",
+                "error": _FROZEN_DAEMON_HINT,
+                "dbus_error": str(exc)[:200],
+            }
+    return wrapper
 
 
 # ========== Tool Definitions ==========
@@ -1119,6 +1200,7 @@ def open_file(file_path: str) -> Dict[str, str]:
 # ========== SMS / Conversations Tools ==========
 
 @mcp.tool()
+@_sms_daemon_guard
 def list_sms_conversations(
     device_id: str,
     refresh: bool = True,
@@ -1177,16 +1259,32 @@ def list_sms_conversations(
         "load": meta,
     }
     if not meta["complete"]:
-        out["warning"] = (
-            f"Thread list is INCOMPLETE — the phone was still streaming when "
-            f"the {wait_seconds}s budget ran out ({meta['cached_before']} -> "
-            f"{total} threads so far). A missing conversation means 'not "
-            f"loaded yet', not 'does not exist'."
-        )
+        # A cache that did not grow at all is the signature of a daemon that
+        # is not streaming but stuck (KDE bug 525025) -- distinguish the two
+        # before blaming the phone, because "still streaming" invites the
+        # caller to simply wait longer, and waiting on a deadlock is futile.
+        if total == meta["cached_before"] and not kdeconnect.daemon_responsive():
+            out["status"] = "error"
+            out["error"] = (
+                "kdeconnectd is not answering D-Bus and the cache did not "
+                "grow — it is deadlocked in its SMS plugin (KDE bug 525025), "
+                "not slow. Waiting longer will not help. Recovery: kill the "
+                "kdeconnectd process (it respawns on the next D-Bus call); "
+                "its SMS cache then starts from empty."
+            )
+        else:
+            out["warning"] = (
+                f"Thread list is INCOMPLETE — the phone was still streaming "
+                f"when the {wait_seconds}s budget ran out "
+                f"({meta['cached_before']} -> {total} threads so far). A "
+                f"missing conversation means 'not loaded yet', not 'does not "
+                f"exist'."
+            )
     return out
 
 
 @mcp.tool()
+@_sms_daemon_guard
 def sms_cache_status(device_id: str) -> Dict[str, Any]:
     """
     Check how much SMS history KDE Connect has loaded so far
@@ -1210,6 +1308,7 @@ def sms_cache_status(device_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_sms_daemon_guard
 def read_sms_conversation(
     device_id: str,
     thread_id: int,
@@ -1269,6 +1368,7 @@ def read_sms_conversation(
 
 
 @mcp.tool()
+@_sms_daemon_guard
 def search_sms(
     device_id: str,
     query: str,
@@ -1386,11 +1486,16 @@ def search_sms(
         candidate_ids = [t["thread_id"] for t in candidates]
         deep_results, deep_coverage = kdeconnect.load_threads_deep(
             device_id, candidate_ids, since_ms=since_ms,
-            concurrency=6, total_budget_seconds=deep_budget_seconds,
+            total_budget_seconds=deep_budget_seconds,
         )
         deep_coverage["threads_skipped_over_cap"] = {
             "count": len(skipped_ids), "thread_ids": skipped_ids,
         }
+        # A daemon deadlocked in the SMS plugin (KDE bug 525025) still lets
+        # this call return -- our own budget ends it -- and the empty result
+        # is indistinguishable from "nothing matched". Probe before
+        # believing it.
+        deep_coverage["daemon_responsive"] = kdeconnect.daemon_responsive()
 
         for tid, msgs in deep_results.items():
             for m in msgs:
@@ -1430,6 +1535,12 @@ def search_sms(
         )
         not_truncated = meta["complete"] and deep_complete
         verdict = "complete" if not_truncated else "partial"
+        if not deep_coverage.get("daemon_responsive", True):
+            # Outranks every other verdict: whatever came back was produced
+            # by a daemon that has since stopped answering, so the result is
+            # a failure, not a finding.
+            verdict = "daemon_frozen"
+            not_truncated = False
 
     coverage = {
         "verdict": verdict,
@@ -1452,7 +1563,17 @@ def search_sms(
         "load": meta,
         "coverage": coverage,
     }
-    if len(matches) == 0 and verdict != "complete":
+    if verdict == "daemon_frozen":
+        out["status"] = "error"
+        out["error"] = (
+            "kdeconnectd stopped answering D-Bus during the deep search — it "
+            "is deadlocked in its SMS plugin (KDE bug 525025), not idle. "
+            "These results are incomplete by an unknown amount and a zero "
+            "count means nothing. Recovery: kill the kdeconnectd process (it "
+            "respawns on the next D-Bus call) and note that its SMS cache "
+            "starts from empty again."
+        )
+    elif len(matches) == 0 and verdict != "complete":
         out["zero_matches_meaning"] = (
             "unsearched surface remains — this is NOT evidence the message "
             "does not exist"
