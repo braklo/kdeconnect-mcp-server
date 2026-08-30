@@ -1,2 +1,3 @@
 fastmcp>=1.0.0
 dbus-python>=1.2.0  # For D-Bus integration (Linux only)
+pygobject>=3.40    # GLib main loop, for async SMS signal collection
