@@ -843,6 +843,7 @@ class KDEConnectDBus:
     def send_sms(
         self, device_id: str, text: str,
         thread_id: int = None, phone: str = None,
+        verify_seconds: float = 90.0,
     ) -> Dict[str, Any]:
         """Send an SMS. If `thread_id` is given, replies into that existing
         thread (preserves conversation continuity, can include multiple
@@ -854,18 +855,115 @@ class KDEConnectDBus:
             raise ValueError(
                 "exactly one of thread_id / phone must be provided"
             )
+        import time
         iface = self._get_conversations_interface(device_id)
+        sent_ms = int(time.time() * 1000)
         if thread_id is not None:
             iface.replyToConversation(
                 dbus.Int64(int(thread_id)), str(text), dbus.Array([], signature="v")
             )
-            return {"status": "sent", "thread_id": int(thread_id), "text": text}
-        addresses = dbus.Array(
-            [dbus.Dictionary({"address": str(phone)}, signature="sv")],
-            signature="a{sv}",
-        )
-        iface.sendWithoutConversation(addresses, str(text), dbus.Array([], signature="v"))
-        return {"status": "sent", "phone": phone, "text": text}
+            target = {"thread_id": int(thread_id)}
+        else:
+            # Each address must travel as a variant holding the struct `(s)`
+            # -- that is how the daemon's `ConversationAddress` demarshals
+            # (models/conversationmessage.h, `operator>>`). A dict `{address:
+            # ...}` used to be sent here; `qdbus_cast<ConversationAddress>`
+            # then yields an EMPTY address, the phone drops the packet, and
+            # nothing errors anywhere. That silently lost SMS on 2026-09-12
+            # (Volla) and 2026-10-05 (Redmi).
+            addresses = dbus.Array(
+                [dbus.Struct((str(phone),), signature="s", variant_level=1)],
+                signature="v",
+            )
+            iface.sendWithoutConversation(
+                addresses, str(text), dbus.Array([], signature="v")
+            )
+            target = {"phone": phone}
+        # Both D-Bus calls are fire-and-forget: returning means only that the
+        # daemon accepted the request. The phone reports its outgoing
+        # message back into the daemon's cache, so watch for it there.
+        target_tid = int(thread_id) if thread_id is not None else \
+            self._thread_for_phone(iface, phone)
+        hit = self._wait_for_sent(iface, device_id, text, sent_ms,
+                                  verify_seconds, target_tid, phone)
+        if hit and hit["direction"] == "failed":
+            return {"status": "failed", **target, "text": text,
+                    "thread_id_seen": hit["thread_id"], "date": hit["date"],
+                    "error": "The phone marked this message as failed."}
+        if hit:
+            return {"status": "confirmed", **target, "text": text,
+                    "thread_id_seen": hit["thread_id"], "date": hit["date"]}
+        return {
+            "status": "unverified", **target, "text": text,
+            "warning": (
+                f"The daemon accepted the request, but the message did not "
+                f"show up in the phone's conversation cache within "
+                f"{verify_seconds:.0f}s. It may still be on its way, or it "
+                f"may have been dropped -- ask the user to check the phone "
+                f"before treating it as sent."
+            ),
+        }
+
+    def _thread_for_phone(self, iface, phone: str):
+        """Existing single-recipient thread with this number, matched on the
+        last nine digits (national vs international notation). None if the
+        cache holds no such thread."""
+        want = "".join(ch for ch in str(phone) if ch.isdigit())[-9:]
+        if len(want) < 9:
+            return None
+        for m in self._cached_threads(iface).values():
+            nums = {"".join(ch for ch in a if ch.isdigit())[-9:]
+                    for a in m["addresses"]}
+            if nums == {want}:
+                return m["thread_id"]
+        return None
+
+    def _wait_for_sent(self, iface, device_id: str, text: str, sent_ms: int,
+                       verify_seconds: float, target_tid=None,
+                       phone: str = None) -> Dict[str, Any]:
+        """Look for an outgoing (or failed) message with this body, dated no
+        earlier than shortly before the send. Returns the parsed message or
+        None.
+
+        Thread heads alone are not enough: a head is only the NEWEST message
+        of a thread, so a reply that arrives right after ours (always the
+        case when texting one's own number) hides it. The phone also may
+        not send immediately -- on 2026-10-05 a message left ~30 s after
+        the call. So the target thread's recent messages are fetched
+        directly every few seconds until `verify_seconds` runs out."""
+        import time
+        want = _norm(text)
+
+        def match(m):
+            return (m["direction"] in ("sent", "failed")
+                    and _norm(m["body"]) == want
+                    and m["date_ms"] >= sent_ms - 60_000)
+
+        deadline = time.time() + max(0.0, float(verify_seconds))
+        next_fetch = time.time() + 3.0
+        while True:
+            for m in self._cached_threads(iface).values():
+                if match(m):
+                    return m
+            if target_tid is None and phone:
+                target_tid = self._thread_for_phone(iface, phone)
+            now = time.time()
+            if target_tid is not None and now >= next_fetch:
+                next_fetch = now + 8.0
+                try:
+                    msgs, _meta = self.load_thread_messages(
+                        device_id, int(target_tid),
+                        since_ms=sent_ms - 60_000, max_rounds=1,
+                        per_round_window=20, round_timeout=6.0,
+                    )
+                    for m in msgs:
+                        if match(m):
+                            return m
+                except dbus.exceptions.DBusException:
+                    pass
+            if time.time() >= deadline:
+                return None
+            time.sleep(self.SMS_POLL_SECONDS)
 
 
 # Initialize KDE Connect interface
@@ -1622,7 +1720,9 @@ def send_sms(
 
     Returns:
         On preview: {status: "preview", would_send: {...}}.
-        On send: {status: "sent", thread_id|phone, text}.
+        On send: {status: "confirmed", ...} once the outgoing message
+        appeared in the phone's conversation cache, otherwise
+        {status: "unverified", warning}. Never treat "unverified" as sent.
     """
     if (thread_id is None) == (phone is None):
         return {
