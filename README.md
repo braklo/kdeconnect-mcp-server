@@ -49,18 +49,27 @@ A Model Context Protocol (MCP) server built with FastMCP that provides seamless 
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/g20271/kdeconnect-mcp-server.git
+   git clone https://github.com/braklo/kdeconnect-mcp-server.git
    cd kdeconnect-mcp-server
    ```
 
-2. Create virtual environment and install dependencies:
+2. Install the D-Bus bindings as **system packages** — `dbus-python` and
+   `PyGObject` need the C libraries and headers of your distribution, and the
+   wheels on PyPI do not build everywhere:
    ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
+   sudo apt install python3-dbus python3-gi kdeconnect      # Debian / Ubuntu
+   sudo zypper install python3-dbus-python python3-gobject kdeconnect-kde   # openSUSE
    ```
 
-3. Verify KDE Connect is running:
+3. Create a virtual environment **that can see those system packages**, and
+   install the rest into it:
+   ```bash
+   python3 -m venv --system-site-packages venv
+   source venv/bin/activate
+   pip install fastmcp
+   ```
+
+4. Verify KDE Connect is running:
    ```bash
    kdeconnect-cli --list-available
    ```
@@ -132,9 +141,36 @@ Two consequences shape this API:
   it only for a thread it does not already hold, so collecting those signals and
   returning them yields a shrinking, arbitrary subset on every repeat call while
   the complete data sits unused in `activeConversations()`. This server reads the
-  cumulative cache instead and polls it until it settles.
+  cumulative cache instead.
 - **Partial results are flagged, never hidden.** `list_sms_conversations` and
   `search_sms` report how much they actually covered.
+
+### When is the thread list complete?
+
+Cache size alone cannot tell you: before the stream starts, and after a couple
+of unrelated pushes, the cache sits still exactly like a finished load
+(measured: "complete" after 32 s with 90 of 1754 threads). So with
+`refresh=true` the server asks the phone to re-stream and watches the daemon's
+`conversationLoaded` signal, which fires once per thread head the phone delivers
+— also for heads the daemon already holds. `complete` is `true` only when the
+phone re-reported at least 98 % of the cached threads in *this* stream and then
+went quiet for `quiet_seconds`; otherwise it is `false` after `wait_seconds`.
+
+A full stream of ~1750 threads takes about five minutes, so a finished one is
+remembered in `~/.cache/kdeconnect-mcp/full_stream.json` (per device: the
+daemon's D-Bus owner and the head count). While the same daemon is running and
+its cache has not shrunk, later calls — from any process — answer
+`complete: true` with `complete_basis: "earlier_full_stream"` without waiting.
+`load` in the result carries `streamed_threads`, `complete_basis` and, if the
+cache emptied mid-call, `cache_reset`.
+
+**The daemon's cache is emptied whenever the phone disconnects, even for a few
+seconds** — the SMS plugin is recreated on reconnect. Afterwards a
+`requestConversation` for a thread the daemon no longer holds is only logged
+("Got a conversationID for a conversation with no messages!") and never
+forwarded to the phone. `read_sms_conversation` detects this and returns
+`not_in_daemon_cache: true` with a warning: an empty result there means an
+unsearched thread, not an empty one. Re-list with `refresh=true` first.
 
 ### Searching
 
@@ -209,10 +245,39 @@ replies will hit it.
 [KDE bug 525021]: https://bugs.kde.org/show_bug.cgi?id=525021
 [KDE bug 525025]: https://bugs.kde.org/show_bug.cgi?id=525025
 
+### Sending
+
+`send_sms` is two-phase: without `confirm=true` it returns a dry-run preview
+and sends nothing. Address the message with `phone`, not `thread_id`:
+replying into an existing thread goes through `replyToConversation`, and on the
+devices tested that produced a **group MMS** that included the sender's own
+number and landed in a new thread. `phone` goes through
+`sendWithoutConversation`, where each address must be marshalled as the D-Bus
+struct `(s)` — a dict demarshals to an empty address and the phone drops the
+packet without any error (that silently lost messages for weeks; there is a
+regression test for it now).
+
+Both D-Bus calls are fire-and-forget, so `send_sms` does not report "sent".
+It watches the daemon's cache for the outgoing message (default 90 s; the phone
+may take ~30 s to actually send) and returns one of:
+
+| status | meaning |
+|---|---|
+| `confirmed` | the phone reported the message as sent (`thread_id_seen`, `date`) |
+| `failed` | the phone marked it as failed |
+| `unverified` | not seen within `verify_seconds` — may still be on its way, or dropped; ask the user to check the phone before treating it as sent |
+
 ### Required permissions
 
 The KDE Connect app on the phone needs **Read SMS** and, for `send_sms`, **Send
 SMS**. Without them the conversations plugin returns nothing at all.
+
+### Concurrent clients
+
+Every MCP client process talks to the same daemon. `list_sms_conversations` and
+`search_sms` with `refresh=true` each ask the phone to re-stream all thread
+heads, which disturbs any other client that is measuring or waiting on the
+stream. Pass `refresh=false` when another process is working the same phone.
 
 ## 💬 Usage Examples
 
@@ -238,14 +303,19 @@ Ask Claude:
 ### Key Components
 
 ```
-mcp_server.py (~1200 lines)
-├── KDEConnectDBus (290 lines)
-│   └── D-Bus interface layer
-├── Pydantic Models (80 lines)
-│   └── Input validation schemas
-└── Tool Definitions (280 lines)
-    └── 14 tools with @mcp.tool() decorators
+mcp_server.py (~1950 lines)
+├── helpers: _parse_sms_message, _norm, _parse_since
+├── KDEConnectDBus (~1000 lines)
+│   ├── device / media / share / notification D-Bus wrappers (upstream)
+│   └── SMS layer: thread streaming, deep loads, liveness probe, send + read-back
+└── Tool definitions
+    └── 19 tools with @mcp.tool() decorators (+ resources and prompts)
+tests/test_sms_unit.py — unit tests that need no phone and no daemon
 ```
+
+Tunables live as class constants on `KDEConnectDBus`: `SMS_DEEP_CONCURRENCY`
+(2, see the deadlock note above), `SMS_STREAM_COVERAGE` (0.98),
+`SMS_POLL_SECONDS` (2), `SMS_HEALTH_TIMEOUT` (10).
 
 ### Input Validation
 
@@ -278,9 +348,27 @@ kdeconnect-mcp-server/
 ├── requirements.txt      # Python dependencies
 ├── pyproject.toml       # Package configuration
 ├── README.md            # This file
-├── SETUP.md             # Detailed setup guide
-└── test_mcp.py          # Test utilities
+├── SETUP.md             # Detailed setup guide (upstream, Japanese)
+├── tests/               # Unit tests (no phone, no daemon needed)
+└── test_mcp.py          # Upstream's manual protocol smoke test
 ```
+
+### Tests
+
+The unit tests stub the session bus and exercise the parts that have actually
+broken before: address marshalling for `sendWithoutConversation`, the
+completeness criterion, diacritic-insensitive matching, `since` parsing, thread
+matching by phone number and the on-disk full-stream marker. They need the
+`dbus` and `gi` packages importable, nothing else:
+
+```bash
+source venv/bin/activate
+python -m unittest discover -s tests -v
+```
+
+Anything that touches the phone (streaming, deep search, sending) is tested
+live only, with a real device and the user's explicit go-ahead for every
+message sent.
 
 ### Extending the Server
 
@@ -341,20 +429,27 @@ killall kdeconnectd
 ### D-Bus errors
 ```bash
 # Install required system packages
-sudo apt install python3-dbus python3-gi kdeconnect
+sudo apt install python3-dbus python3-gi kdeconnect                      # Debian / Ubuntu
+sudo zypper install python3-dbus-python python3-gobject kdeconnect-kde   # openSUSE
+# and make sure the venv was created with --system-site-packages
 ```
+
+### SMS tools return nothing, or `daemon_frozen`
+See [Two daemon bugs this client works around](#two-daemon-bugs-this-client-works-around).
+A frozen daemon is recovered with `kill <pid of kdeconnectd>`; it respawns on
+the next D-Bus call with an empty SMS cache.
 
 ## 📋 Requirements
 
 ### System Requirements
-- Linux (Ubuntu 24.04+ recommended)
-- KDE Connect 24.x+
-- D-Bus
+- Linux with a session D-Bus (tested on Ubuntu 24.04 and openSUSE Tumbleweed)
+- KDE Connect 24.x+ (SMS layer tested against 26.04 and 26.08)
+- An Android phone running the KDE Connect app (iOS has no SMS plugin)
 
 ### Python Requirements
 - Python 3.12+
 - fastmcp >= 1.0.0
-- dbus-python >= 1.2.0 (system package)
+- dbus-python >= 1.2.0 and PyGObject >= 3.40 (system packages)
 
 ## 🤝 Contributing
 

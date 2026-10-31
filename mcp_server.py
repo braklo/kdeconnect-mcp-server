@@ -572,8 +572,7 @@ class KDEConnectDBus:
                 track["previous"] = len(seen)
                 covered = len(streamed & set(seen))
                 quiet = now - state["last_activity"] >= quiet_seconds
-                if (seen and quiet
-                        and covered >= self.SMS_STREAM_COVERAGE * len(seen)):
+                if self._stream_complete(len(seen), covered, quiet):
                     complete, basis = True, "full_stream"
                     loop.quit()
                     return False
@@ -616,6 +615,16 @@ class KDEConnectDBus:
     # the load counts as complete. Below 1.0 only so that threads deleted on
     # the phone (still held by the daemon) cannot block completion forever.
     SMS_STREAM_COVERAGE = 0.98
+
+    @classmethod
+    def _stream_complete(cls, cached: int, covered: int, quiet: bool) -> bool:
+        """The completeness criterion, kept free of D-Bus and timers so it
+        can be unit-tested: the phone re-reported at least
+        `SMS_STREAM_COVERAGE` of the `cached` heads in this stream
+        (`covered`) and the stream has since gone `quiet`. An empty cache
+        is never complete -- silence before the stream starts looks exactly
+        like silence after it ends."""
+        return bool(cached) and quiet and covered >= cls.SMS_STREAM_COVERAGE * cached
 
     _FULL_STREAM_FILE = os.path.expanduser(
         "~/.cache/kdeconnect-mcp/full_stream.json")
