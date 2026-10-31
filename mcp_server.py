@@ -513,44 +513,146 @@ class KDEConnectDBus:
         hold, so every repeat request yields a shrinking, arbitrary subset
         while the complete data sits unused in the cache.
 
-        With `refresh=True` we ask the phone to (re)stream, then wait until
-        the cache stops growing for `quiet_seconds` or `wait_seconds` runs
-        out. `meta["complete"]` says which of the two ended the wait, so the
-        caller can tell a finished load from a truncated one.
+        With `refresh=True` we ask the phone to (re)stream and watch the
+        daemon's `conversationLoaded` signal, which fires once per thread
+        head the phone delivers -- also for heads the daemon already holds,
+        when the cache size does not change at all (measured 2026-10-30:
+        1754 cached heads, count flat, ~5 loaded signals/s for minutes).
+
+        `meta["complete"]` is True only when the phone re-reported (nearly)
+        every cached thread in THIS stream and then went quiet. Cache size
+        alone cannot say that: before the stream starts, and after a
+        couple of unrelated pushes, it sits still exactly like a finished
+        load (2026-10-30: "complete" after 32 s with 90 of 1754 threads).
+
+        A finished full stream is remembered on disk for the running daemon
+        (its D-Bus owner) and head count, so later calls -- including other
+        MCP processes -- can say "complete" without re-waiting minutes. A
+        daemon restart or a shrunken cache (the SMS plugin is recreated on
+        reconnect and starts empty) invalidates it.
         """
         import time
         iface = self._get_conversations_interface(device_id)
         started = time.time()
         seen = self._cached_threads(iface)
         cached_before = len(seen)
-        complete = True
+        owner = self._daemon_owner()
+        earlier_full = self._full_stream_valid(device_id, owner, cached_before)
+        complete = earlier_full
+        basis = "earlier_full_stream" if earlier_full else None
+        streamed: set = set()
+        cache_reset = False
 
         if refresh:
-            complete = False
-            iface.requestAllConversationThreads()
-            previous = cached_before
-            stable_since = None
-            while time.time() - started < wait_seconds:
-                time.sleep(self.SMS_POLL_SECONDS)
+            state = {"last_activity": time.time(), "last_growth": time.time()}
+
+            def on_loaded(conv_id, *_, **__):
+                try:
+                    streamed.add(int(conv_id))
+                    state["last_activity"] = time.time()
+                except Exception:
+                    pass
+
+            match = self.bus.add_signal_receiver(
+                on_loaded, signal_name="conversationLoaded",
+                dbus_interface="org.kde.kdeconnect.device.conversations",
+                path=f"{self.DEVICE_PATH_PREFIX}/{device_id}",
+            )
+            loop = GLib.MainLoop()
+            track = {"previous": cached_before}
+
+            def poll():
+                nonlocal seen, cache_reset, complete, basis
+                now = time.time()
                 seen = self._cached_threads(iface)
-                if len(seen) == previous:
-                    if stable_since is None:
-                        stable_since = time.time()
-                    elif time.time() - stable_since >= quiet_seconds:
-                        complete = True
-                        break
-                else:
-                    stable_since = None
-                previous = len(seen)
+                if len(seen) < track["previous"]:
+                    cache_reset = True        # plugin recreated, cache emptied
+                if len(seen) != track["previous"]:
+                    state["last_activity"] = state["last_growth"] = now
+                track["previous"] = len(seen)
+                covered = len(streamed & set(seen))
+                quiet = now - state["last_activity"] >= quiet_seconds
+                if (seen and quiet
+                        and covered >= self.SMS_STREAM_COVERAGE * len(seen)):
+                    complete, basis = True, "full_stream"
+                    loop.quit()
+                    return False
+                if (earlier_full and not cache_reset
+                        and now - state["last_growth"] >= quiet_seconds):
+                    # Cache already known complete; the phone re-sends every
+                    # head anyway, so only growth (new threads) matters.
+                    loop.quit()
+                    return False
+                if now - started >= wait_seconds:
+                    loop.quit()
+                    return False
+                return True
+
+            GLib.timeout_add(int(self.SMS_POLL_SECONDS * 1000), poll)
+            try:
+                iface.requestAllConversationThreads()
+                loop.run()
+            finally:
+                match.remove()
+            if cache_reset:
+                complete, basis = False, None
+            if basis == "full_stream":
+                self._remember_full_stream(device_id, owner, len(seen))
 
         threads = sorted(seen.values(), key=lambda m: m["date_ms"], reverse=True)
         meta = {
             "complete": complete,
+            "complete_basis": basis,
             "cached_before": cached_before,
             "cached_after": len(threads),
+            "streamed_threads": len(streamed),
             "waited_seconds": round(time.time() - started, 1),
         }
+        if cache_reset:
+            meta["cache_reset"] = True
         return threads, meta
+
+    # Share of cached threads the phone must re-report in one stream before
+    # the load counts as complete. Below 1.0 only so that threads deleted on
+    # the phone (still held by the daemon) cannot block completion forever.
+    SMS_STREAM_COVERAGE = 0.98
+
+    _FULL_STREAM_FILE = os.path.expanduser(
+        "~/.cache/kdeconnect-mcp/full_stream.json")
+
+    def _daemon_owner(self):
+        try:
+            return str(self.bus.get_name_owner(self.BUS_NAME))
+        except dbus.exceptions.DBusException:
+            return None
+
+    def _full_stream_valid(self, device_id: str, owner, heads: int) -> bool:
+        import json
+        try:
+            with open(self._FULL_STREAM_FILE) as f:
+                rec = json.load(f).get(device_id)
+        except (OSError, ValueError):
+            return False
+        return bool(rec and owner and rec.get("owner") == owner
+                    and heads >= int(rec.get("heads", 0)) > 0)
+
+    def _remember_full_stream(self, device_id: str, owner, heads: int):
+        import json, time
+        if not owner:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._FULL_STREAM_FILE), exist_ok=True)
+            try:
+                with open(self._FULL_STREAM_FILE) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = {}
+            data[device_id] = {"owner": owner, "heads": int(heads),
+                               "at": int(time.time())}
+            with open(self._FULL_STREAM_FILE, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
 
     def sms_cache_status(self, device_id: str) -> Dict[str, Any]:
         """Cheap progress probe: how many threads the daemon holds right now
@@ -604,6 +706,19 @@ class KDEConnectDBus:
         """
         iface = self._get_conversations_interface(device_id)
         tid = int(thread_id)
+        if tid not in self._cached_threads(iface):
+            # The daemon answers requestConversation only for threads it
+            # already holds; for any other it logs "Got a conversationID for
+            # a conversation with no messages!" and never asks the phone --
+            # typically right after a reconnect, which recreates the SMS
+            # plugin with an empty cache. An empty result here is therefore
+            # an unsearched thread, not an empty one.
+            return [], {
+                "complete": False, "rounds": 0, "messages": 0,
+                "reported_count": None, "converged": False,
+                "reached_since": False, "timed_out": False,
+                "not_in_daemon_cache": True,
+            }
         seen: Dict[int, Dict[str, Any]] = {}
         reported_count = None
         converged = False
@@ -1370,13 +1485,23 @@ def list_sms_conversations(
                 "kdeconnectd process (it respawns on the next D-Bus call); "
                 "its SMS cache then starts from empty."
             )
+        elif meta.get("cache_reset"):
+            out["warning"] = (
+                f"Thread list is INCOMPLETE — the daemon's SMS cache was "
+                f"emptied during the load (the phone reconnected, which "
+                f"recreates the SMS plugin) and holds {total} threads now. "
+                f"Call again with refresh=true and a longer wait_seconds."
+            )
         else:
             out["warning"] = (
-                f"Thread list is INCOMPLETE — the phone was still streaming "
-                f"when the {wait_seconds}s budget ran out "
-                f"({meta['cached_before']} -> {total} threads so far). A "
-                f"missing conversation means 'not loaded yet', not 'does not "
-                f"exist'."
+                f"Thread list is NOT CONFIRMED COMPLETE — within the "
+                f"{wait_seconds}s budget the phone re-reported "
+                f"{meta['streamed_threads']} of the {total} cached threads "
+                f"({meta['cached_before']} -> {total} cached). A full "
+                f"history streams at ~5-6 threads/s, i.e. minutes; once one "
+                f"full stream has finished, later calls are confirmed "
+                f"immediately. A missing conversation means 'not loaded "
+                f"yet', not 'does not exist'."
             )
     return out
 
@@ -1462,6 +1587,12 @@ def read_sms_conversation(
         "truncated": total_messages > len(messages),
         "complete": meta["complete"],
         "load": meta,
+        **({"warning": (
+            "The daemon does not hold this thread (its cache is empty or "
+            "was reset by a reconnect), so the phone was never asked. Zero "
+            "messages here means unsearched, not empty. Run "
+            "list_sms_conversations with refresh=true first."
+        )} if meta.get("not_in_daemon_cache") else {}),
     }
 
 
